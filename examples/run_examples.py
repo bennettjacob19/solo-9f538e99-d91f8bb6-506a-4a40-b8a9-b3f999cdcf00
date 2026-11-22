@@ -25,6 +25,89 @@ CASES = [
     ("EOS stop", [2, 62, 32, 11], 24, 4),
 ]
 
+# Batch scenario exercised after the single-request cases.
+BATCH_PROMPTS = [
+    ([2, 34, 24, 11], 16),          # short prompt, fills its cap
+    ([2], 5),                       # shortest prompt
+    ([2, 62, 32, 11], 24),          # hits <eos> early and leaves the batch
+    ([2, 22, 30, 11, 19, 3, 8, 12, 5, 7, 44, 19], 6),  # long prompt
+]
+BATCH_BUDGET = 4096
+
+
+def local_batch_report(prompts, caps, budget):
+    from app.batching import batched_greedy_decode
+    from app.decoding import greedy_decode
+    from app.model import TARGET_MODEL
+
+    result = batched_greedy_decode(TARGET_MODEL, prompts, caps, budget)
+    per_request = [greedy_decode(TARGET_MODEL, p, c) for p, c in zip(prompts, caps)]
+    return {
+        "identical": all(
+            s.continuation == g.continuation and s.stop_reason == g.stop_reason
+            for s, g in zip(result.samples, per_request)
+        ),
+        "samples": [
+            {
+                "continuation": s.continuation,
+                "stop_reason": s.stop_reason,
+            }
+            for s in result.samples
+        ],
+        "forwards": [
+            {
+                "phase": f.phase,
+                "samples": f.sample_indices,
+                "score_elements": f.attention_score_elements,
+            }
+            for f in result.forwards
+        ],
+    }
+
+
+def remote_batch_report(url, prompts, caps, budget):
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({
+        "prompts": [
+            {"prompt_token_ids": p, "max_new_tokens": c}
+            for p, c in zip(prompts, caps)
+        ],
+        "attention_score_budget": budget,
+    }).encode()
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/decode/batch", data=body,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        payload = json.load(exc)
+        detail = payload.get("detail", payload)
+        if isinstance(detail, str):
+            detail = {"message": detail}
+        return {"status": exc.code, "detail": detail}
+    return {
+        "identical": True,
+        "samples": [
+            {
+                "continuation": s["continuation_token_ids"],
+                "stop_reason": s["stop_reason"],
+            }
+            for s in data["samples"]
+        ],
+        "forwards": [
+            {
+                "phase": f["phase"],
+                "samples": f["sample_indices"],
+                "score_elements": f["attention_score_elements"],
+            }
+            for f in data["forwards"]
+        ],
+    }
+
 
 def local_report(prompt: list[int], max_new: int, block: int) -> dict:
     from app.decoding import greedy_decode, speculative_decode
@@ -113,6 +196,78 @@ def main() -> int:
         for i, r in enumerate(rep["rounds"]):
             print(f"  round {i}: draft={r['draft']} accepted={r['accepted']} "
                   f"corrected={r['corrected']} emitted={r['emitted']}")
+
+    # Batch: mixed lengths, an early EOS exit, then a budget that is too small.
+    if args.url:
+        rep = remote_batch_report(args.url, [p for p, _ in BATCH_PROMPTS],
+                                  [c for _, c in BATCH_PROMPTS], BATCH_BUDGET)
+    else:
+        rep = local_batch_report([p for p, _ in BATCH_PROMPTS],
+                                 [c for _, c in BATCH_PROMPTS], BATCH_BUDGET)
+
+    print("\n=== batch: mixed lengths + early EOS ===")
+    if "samples" not in rep:
+        print(f"unexpected error: {rep}")
+        return 1
+    ok &= rep["identical"]
+    print(f"outputs identical to per-request /decode greedy: {rep['identical']}")
+    for i, (prompt, cap) in enumerate(BATCH_PROMPTS):
+        sample = rep["samples"][i]
+        print(f"  sample {i}: prompt_len={len(prompt)} cap={cap} "
+              f"stop={sample['stop_reason']} len={len(sample['continuation'])}"
+              f" continuation={sample['continuation']}")
+    for f in rep["forwards"]:
+        print(f"  forward {f['phase']:7s} samples={f['samples']} "
+              f"score_elements={f['score_elements']}")
+
+    # Budget small enough to reject sample 3 (a 12-token prompt needs
+    # 4*12*12 = 576 elements for its own prefill) but large enough for the
+    # short prompts to keep batching together.
+    insufficient = 256
+    if args.url:
+        bad = remote_batch_report(args.url, [p for p, _ in BATCH_PROMPTS],
+                                  [c for _, c in BATCH_PROMPTS], insufficient)
+    else:
+        from app.batching import AttentionBudgetError
+
+        try:
+            local_batch_report([p for p, _ in BATCH_PROMPTS],
+                               [c for _, c in BATCH_PROMPTS], insufficient)
+        except AttentionBudgetError as exc:
+            bad = {"detail": {
+                "error": "attention_score_budget_exceeded",
+                "message": str(exc),
+                "sample_index": exc.sample_index,
+            }}
+        else:
+            bad = {}
+
+    print(f"\n=== batch: insufficient budget ({insufficient}) ===")
+    detail = bad.get("detail", {})
+    print(f"rejected: {detail.get('error')} at sample_index="
+          f"{detail.get('sample_index')}")
+    print(f"message: {detail.get('message')}")
+
+    # The same prompts under a budget that still separates the long sample but
+    # lets it run on its own: the short samples remain batched.
+    squeezed = 576
+    if args.url:
+        sq = remote_batch_report(args.url, [p for p, _ in BATCH_PROMPTS],
+                                 [c for _, c in BATCH_PROMPTS], squeezed)
+    else:
+        sq = local_batch_report([p for p, _ in BATCH_PROMPTS],
+                                [c for _, c in BATCH_PROMPTS], squeezed)
+
+    print(f"\n=== batch: tight budget ({squeezed}), long sample runs alone ===")
+    if "samples" in sq:
+        ok &= sq["identical"]
+        print(f"outputs identical: {sq['identical']}")
+        print(f"prefill groups: "
+              f"{[f['samples'] for f in sq['forwards'] if f['phase'] == 'prefill']}")
+        print(f"max score elements in a forward: "
+              f"{max(f['score_elements'] for f in sq['forwards'])}")
+    else:
+        print(f"unexpected error: {sq}")
 
     return 0 if ok else 1
 

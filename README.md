@@ -46,6 +46,50 @@ tokens, accepted count, corrected token, and emitted tokens.
 Other endpoints: `GET /health`, `GET /models` (architecture, parameter count,
 per-model weight digest).
 
+## Batched greedy continuation (at `/docs`, `POST /decode/batch`)
+
+For offline evaluation of a mixed-length prompt set: up to 8 prompts are
+prefilled and continued together, sharing model forwards where they fit.
+
+| field | meaning | constraints |
+|---|---|---|
+| `prompts[].prompt_token_ids` | prompt token ids | 1–256 ids, each in `[0, 63]` |
+| `prompts[].max_new_tokens` | that sample's continuation cap | 1–128 |
+| `attention_score_budget` | per-forward cap on attention-score elements | 1–50,000,000 |
+
+Each prompt is prefilled in full. Prefill and continuation both batch samples
+of different lengths into one model forward: the query/key axes are padded to
+the batch maximum and every sample keeps its own KV cache at its own absolute
+positions, so each forward evaluates only new tokens. Existing cache entries
+are right-aligned on the key axis so a sample's keys sit at its own indices.
+
+A forward's attention-score element count is exactly
+
+```
+batch_size × n_heads × padded_query_positions × padded_key_positions
+```
+
+with both the query and key padding counted, because the rectangular score
+tensor is what the pass materialises. Samples are packed shortest-first. A
+long sample that will not fit beside the short ones is given its own forward
+while the short samples still share one — it never blocks them. If one sample
+cannot fit a forward even by itself, the whole batch is rejected with HTTP 422
+and that sample's `sample_index`. Prefill overruns are detected before any
+forward runs; a decode forward can only outgrow the budget as caches lengthen,
+so that rejection is reported when the offending decode step is reached.
+Exceeding `max_pos` is reported the same way.
+
+Each sample exits independently on `<eos>` or at its own cap; the remaining
+samples keep batching. Results come back in submission order, and each
+`continuation_token_ids` / `stop_reason` equals the `greedy` output of
+`POST /decode` for that prompt. The response also includes a `forwards` ledger:
+per forward, its `phase` (`prefill`/`decode`), `sample_indices`, `batch_size`,
+padded `query_positions` / `key_positions`, and `attention_score_elements`,
+plus `total_forwards` and `total_attention_score_elements`.
+
+Note: `target_positions_evaluated` counts real tokens per sample, not padding;
+the padding only shows up in the per-forward `attention_score_elements`.
+
 ## Models
 
 Two deterministic single-layer pre-norm causal-attention transformers in
@@ -134,10 +178,13 @@ target forwards: greedy=14 speculative=9
 
 ## Tests
 
-`pytest -q` runs 224 tests: greedy vs speculative equality across prompts,
+`pytest -q` runs 251 tests: greedy vs speculative equality across prompts,
 block sizes and caps; speculative and greedy vs a brute-force no-cache
 reference; KV-cache reuse vs full recomputation; cache truncation paths;
-EOS handling; forward-call accounting; API validation and both sample inputs.
+EOS handling; forward-call accounting; batched forward vs single-sample
+forward equality; batched greedy vs per-request greedy equality across mixed
+lengths and caps; budget packing and rejection indexes; API validation and
+both sample inputs.
 
 ## Known limitations
 
@@ -147,13 +194,22 @@ EOS handling; forward-call accounting; API validation and both sample inputs.
   fit above; they are a correctness harness, not a real language model.
 * `max_pos=512`; requests exceeding it return HTTP 422.
 * The app keeps no state between requests; there is no streaming endpoint.
+* `/decode/batch` uses the target model only (no speculation). Its packing is
+  greedy shortest-first, not a search for the globally cheapest schedule; the
+  per-forward score budget is enforced exactly, but the total across the batch
+  is not minimised.
+* The budget model counts attention-score elements only, not FFN MACs, so
+  padding inflates the count but not the real FLOPs saved by sharing a call.
+* Samples that stop early free their slots, but batch membership is decided
+  per forward; there is no cross-request scheduler.
 
 ## Layout
 
 ```
-app/model.py      NumPy causal LM, KV cache, draft distillation
+app/model.py      NumPy causal LM, KV cache, batched forward, draft distillation
 app/decoding.py   greedy + speculative decoders and traces
-app/main.py       FastAPI app (/decode, /models, /health, /docs)
-tests/            decoding + API tests
+app/batching.py   budgeted batched greedy continuation
+app/main.py       FastAPI app (/decode, /decode/batch, /models, /health, /docs)
+tests/            decoding + batching + API tests
 examples/         runnable sample report
 ```

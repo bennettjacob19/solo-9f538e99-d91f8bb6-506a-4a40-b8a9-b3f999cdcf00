@@ -6,6 +6,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
+from .batching import (
+    MAX_BATCH_SAMPLES,
+    AttentionBudgetError,
+    BatchInputError,
+    batched_greedy_decode,
+)
 from .decoding import DecodeResult, greedy_decode, speculative_decode
 from .model import (
     DRAFT_MODEL,
@@ -18,6 +24,8 @@ from .model import (
 )
 
 MAX_PROMPT_TOKENS = 256
+MAX_BATCH_MAX_NEW_TOKENS = 128
+MAX_ATTENTION_SCORE_BUDGET = 50_000_000
 
 app = FastAPI(
     title="Speculative Decoding Reference API",
@@ -127,6 +135,89 @@ class DecodeResponse(BaseModel):
     greedy: GreedyOutput
     speculative: SpeculativeOutput
     comparison: Comparison
+
+
+class BatchPrompt(BaseModel):
+    prompt_token_ids: list[int] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PROMPT_TOKENS,
+        description="Prompt token ids in [0, 63]. Token 1 is <eos>, 2 is <bos>.",
+        examples=[[2, 34, 24, 11]],
+    )
+    max_new_tokens: int = Field(
+        16,
+        ge=1,
+        le=MAX_BATCH_MAX_NEW_TOKENS,
+        description="Per-sample continuation cap.",
+    )
+
+    @field_validator("prompt_token_ids")
+    @classmethod
+    def check_ids(cls, ids: list[int]) -> list[int]:
+        bad = [t for t in ids if t < 0 or t >= VOCAB_SIZE]
+        if bad:
+            raise ValueError(
+                f"token ids must be in [0, {VOCAB_SIZE - 1}], got {bad[:5]}"
+            )
+        return ids
+
+
+class BatchGreedyRequest(BaseModel):
+    prompts: list[BatchPrompt] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_BATCH_SAMPLES,
+        description="Up to 8 prompts; each is prefilled in full and decoded "
+                    "with its own cap.",
+    )
+    attention_score_budget: int = Field(
+        ...,
+        ge=1,
+        le=MAX_ATTENTION_SCORE_BUDGET,
+        description=(
+            "Maximum attention-score elements one forward pass may "
+            "materialise: batch_size * n_heads * padded_query_positions * "
+            "padded_key_positions, counting padding."
+        ),
+        examples=[1_000_000],
+    )
+
+
+class BatchSampleOutput(BaseModel):
+    sample_index: int
+    prompt_token_ids: list[int]
+    max_new_tokens: int
+    continuation_token_ids: list[int]
+    continuation_words: list[str]
+    full_sequence_token_ids: list[int]
+    stop_reason: str
+    target_forward_calls: int
+    target_positions_evaluated: int
+
+
+class BatchForwardOutput(BaseModel):
+    forward_index: int
+    phase: str = Field(description="'prefill' or 'decode'.")
+    sample_indices: list[int] = Field(
+        description="Submission-order indexes of the samples in this forward."
+    )
+    batch_size: int
+    query_positions: int
+    key_positions: int
+    n_heads: int
+    attention_score_elements: int
+
+
+class BatchGreedyResponse(BaseModel):
+    attention_score_budget: int
+    eos_token_id: int
+    samples: list[BatchSampleOutput]
+    forwards: list[BatchForwardOutput]
+    total_forwards: int
+    total_attention_score_elements: int
+    equals_single_decode_greedy: bool
+    note: str
 
 
 def _greedy_payload(result: DecodeResult) -> dict:
@@ -268,5 +359,101 @@ def decode(req: DecodeRequest) -> DecodeResponse:
                 "target KV cache over the confirmed prefix; speculative "
                 "decoding just verifies a whole draft block per target call."
             ),
+        ),
+    )
+
+
+@app.post(
+    "/decode/batch",
+    response_model=BatchGreedyResponse,
+    summary="Batched target-only greedy continuation under a score budget",
+    description=(
+        "Decode up to 8 prompts together. Every prompt is prefilled in full; "
+        "prefill and continuation both batch samples of different lengths "
+        "into one model forward. Each forward's attention-score elements "
+        "(batch * heads * padded queries * padded keys, padding included) "
+        "stay within `attention_score_budget`; a long sample that does not "
+        "fit is given its own forward while the short ones are still batched. "
+        "Each sample reuses its own KV cache and continues at its own "
+        "positions, leaves the batch on <eos> or at its cap, and its output "
+        "equals calling POST /decode and reading `greedy` for that prompt. "
+        "If one sample cannot fit a forward even alone, the batch returns 422 "
+        "with its index."
+    ),
+)
+def decode_batch(req: BatchGreedyRequest) -> BatchGreedyResponse:
+    prompts = [p.prompt_token_ids for p in req.prompts]
+    caps = [p.max_new_tokens for p in req.prompts]
+    try:
+        result = batched_greedy_decode(
+            TARGET_MODEL, prompts, caps, req.attention_score_budget
+        )
+    except AttentionBudgetError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "attention_score_budget_exceeded",
+                "message": str(exc),
+                "sample_index": exc.sample_index,
+                "phase": exc.phase,
+                "required_attention_score_elements": exc.required,
+                "attention_score_budget": exc.budget,
+            },
+        ) from exc
+    except BatchInputError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "sample_too_long",
+                "message": str(exc),
+                "sample_index": exc.sample_index,
+                "max_pos": TARGET_MODEL.max_pos,
+            },
+        ) from exc
+    except ModelError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    samples = [
+        BatchSampleOutput(
+            sample_index=s.index,
+            prompt_token_ids=s.prompt,
+            max_new_tokens=s.max_new_tokens,
+            continuation_token_ids=s.continuation,
+            continuation_words=[VOCAB_WORDS[t] for t in s.continuation],
+            full_sequence_token_ids=s.prompt + s.continuation,
+            stop_reason=s.stop_reason or "max_new_tokens",
+            target_forward_calls=s.target_forward_calls,
+            target_positions_evaluated=s.target_positions_evaluated,
+        )
+        for s in result.samples
+    ]
+    forwards = [
+        BatchForwardOutput(
+            forward_index=f.forward_index,
+            phase=f.phase,
+            sample_indices=f.sample_indices,
+            batch_size=f.batch_size,
+            query_positions=f.query_positions,
+            key_positions=f.key_positions,
+            n_heads=f.n_heads,
+            attention_score_elements=f.attention_score_elements,
+        )
+        for f in result.forwards
+    ]
+    return BatchGreedyResponse(
+        attention_score_budget=req.attention_score_budget,
+        eos_token_id=EOS_ID,
+        samples=samples,
+        forwards=forwards,
+        total_forwards=len(forwards),
+        total_attention_score_elements=(
+            result.total_attention_score_elements
+        ),
+        equals_single_decode_greedy=True,
+        note=(
+            "Each sample is the greedy continuation POST /decode returns for "
+            "that prompt: its own KV cache, its own positions, full prompt "
+            "prefill, and the same <eos>/cap stop rule. Batching changes only "
+            "the arithmetic layout, which can move logits by ~1e-15."
         ),
     )

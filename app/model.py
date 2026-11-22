@@ -71,6 +71,28 @@ def _softmax(x: np.ndarray) -> np.ndarray:
 
 
 @dataclass(frozen=True)
+class BatchForwardInfo:
+    """Shape/accounting details of one batched forward pass.
+
+    ``query_positions`` is the padded query width shared by the batch (it is
+    larger than the per-sample new-token count when samples have different
+    lengths).  ``score_elements`` is the exact number of attention-score
+    elements the rectangular forward computes:
+
+        batch_size * n_heads * query_positions * key_positions
+
+    Padding on both the query and key axes is included, as required for
+    compute accounting.
+    """
+
+    batch_size: int
+    n_heads: int
+    query_positions: int
+    key_positions: int
+    score_elements: int
+
+
+@dataclass(frozen=True)
 class CausalLM:
     """A pre-norm single-layer causal attention transformer."""
 
@@ -258,6 +280,168 @@ class CausalLM:
             np.concatenate([v_past, v_new.transpose(1, 0, 2)], axis=0),
         )
         return logits, new_cache
+
+    # ---------------------------------------------------------- batched forward
+    def forward_batch(
+        self,
+        tokens: list[list[int]] | list[np.ndarray],
+        caches: list[tuple[np.ndarray, np.ndarray] | None] | None = None,
+    ) -> tuple[
+        list[np.ndarray],
+        list[tuple[np.ndarray, np.ndarray]],
+        BatchForwardInfo,
+    ]:
+        """One forward pass shared by several samples of different lengths.
+
+        Every sample supplies a non-empty run of new tokens and its own KV
+        cache (the cache may be ``None``).  The samples are laid out in one
+        padded rectangular batch: the query axis is widened to the longest new
+        run, the key axis to ``max_past + max_new``.  Cached keys are
+        right-aligned on the key axis so that a sample's positions are its own
+        (each sample appends at ``len(its cache)``), and the causal mask is
+        built from those absolute positions.  Padded query rows are masked to
+        a uniform distribution and never contribute to a real result; padded
+        keys are masked out of every real query.  Padding *is* included in the
+        reported attention-score element count, because the rectangular
+        ``(batch, heads, padded queries, padded keys)`` score tensor is what
+        the pass actually materialises.
+
+        Returns ``(logits, caches, info)`` where ``logits[i]`` has shape
+        ``(len(tokens[i]), vocab)`` -- exactly the rows for sample ``i``'s new
+        tokens -- and ``caches[i]`` covers that sample's full prefix.
+        """
+        n_samples = len(tokens)
+        if n_samples == 0:
+            raise ModelError("forward_batch requires at least one sample")
+        if caches is None:
+            caches = [None] * n_samples
+        if len(caches) != n_samples:
+            raise ModelError("forward_batch: one cache entry per sample")
+
+        hd = self.head_dim
+        toks: list[np.ndarray] = []
+        for i, seq in enumerate(tokens):
+            tok = np.asarray(seq, dtype=np.int64)
+            if tok.ndim != 1:
+                raise ModelError(
+                    f"forward_batch: sample {i} is not a 1-D token array"
+                )
+            if tok.size == 0:
+                raise ModelError(
+                    f"forward_batch: sample {i} needs at least one new token"
+                )
+            if tok.min() < 0 or tok.max() >= self.vocab_size:
+                raise ModelError(
+                    f"forward_batch: sample {i} token id out of range "
+                    f"[0, {self.vocab_size - 1}]"
+                )
+            toks.append(tok)
+
+        pasts: list[int] = []
+        for i, cache in enumerate(caches):
+            if cache is None:
+                pasts.append(0)
+                continue
+            k_past, v_past = cache
+            if k_past.ndim != 3 or k_past.shape != v_past.shape:
+                raise ModelError(f"forward_batch: malformed cache for sample {i}")
+            if k_past.shape[1:] != (self.n_heads, hd):
+                raise ModelError(
+                    f"forward_batch: cache for sample {i} has the wrong head "
+                    "shape"
+                )
+            pasts.append(int(k_past.shape[0]))
+
+        new_lengths = [int(t.size) for t in toks]
+        totals = [p + n for p, n in zip(pasts, new_lengths)]
+        for i, total in enumerate(totals):
+            if total > self.max_pos:
+                raise ModelError(
+                    f"forward_batch: sample {i} sequence length {total} "
+                    f"exceeds max_pos={self.max_pos}"
+                )
+
+        batch = n_samples
+        q_width = max(new_lengths)
+        max_past = max(pasts)
+        k_width = max_past + q_width
+
+        tok_pad = np.full((batch, q_width), PAD_ID, dtype=np.int64)
+        pos_idx = np.zeros((batch, q_width), dtype=np.int64)
+        q_abs = np.full((batch, q_width), -1, dtype=np.int64)
+        for i, (tok, past) in enumerate(zip(toks, pasts)):
+            n = new_lengths[i]
+            tok_pad[i, :n] = tok
+            pos_idx[i, :n] = past + np.arange(n)
+            q_abs[i, :n] = past + np.arange(n)
+
+        x = self.embed[tok_pad] + self.pos[pos_idx]
+
+        h = _layer_norm(x, self.gamma_1)
+        q = (h @ self.w_q).reshape(batch, q_width, self.n_heads, hd)
+        q = q.transpose(0, 2, 1, 3)  # (B, H, Q, hd)
+        k_new = (h @ self.w_k).reshape(batch, q_width, self.n_heads, hd)
+        v_new = (h @ self.w_v).reshape(batch, q_width, self.n_heads, hd)
+
+        k_all = np.zeros((batch, k_width, self.n_heads, hd), dtype=np.float64)
+        v_all = np.zeros_like(k_all)
+        k_abs = np.full((batch, k_width), -1, dtype=np.int64)
+        for i, (past, n) in enumerate(zip(pasts, new_lengths)):
+            cache = caches[i]
+            if past:
+                # Right-align the cached keys so index `past` of this sample is
+                # the same slot as in an unpadded single-sample pass.
+                k_all[i, max_past - past:max_past] = cache[0]
+                v_all[i, max_past - past:max_past] = cache[1]
+                start = max_past - past
+                k_abs[i, start:max_past] = np.arange(past)
+            k_all[i, max_past:max_past + n] = k_new[i, :n]
+            v_all[i, max_past:max_past + n] = v_new[i, :n]
+            k_abs[i, max_past:max_past + n] = past + np.arange(n)
+
+        # (B, H, Q, K): every element, padding included, is materialised and
+        # therefore counted in the budget.
+        scores = np.einsum("bhqd,bkhd->bhqk", q, k_all) / np.sqrt(hd)
+        allowed = (
+            (q_abs[:, :, None] >= 0)
+            & (k_abs[:, None, :] >= 0)
+            & (k_abs[:, None, :] <= q_abs[:, :, None])
+        )
+        scores = np.where(allowed[:, None, :, :], scores, -np.inf)
+        padded_queries = q_abs < 0
+        if np.any(padded_queries):
+            # Rows for padding queries are not part of any result; give them a
+            # finite uniform distribution so softmax cannot produce NaNs.
+            scores = np.where(padded_queries[:, None, :, None], 0.0, scores)
+
+        attn = np.einsum("bhqk,bkhd->bhqd", _softmax(scores), v_all)
+        x = x + attn.transpose(0, 2, 1, 3).reshape(
+            batch, q_width, self.d_model
+        ) @ self.w_o
+
+        h = _layer_norm(x, self.gamma_2)
+        x = x + _gelu(h @ self.w_in) @ self.w_out
+        x = _layer_norm(x, self.gamma_2)
+        logits = x @ self.embed_out
+
+        out_logits = [logits[i, :new_lengths[i]] for i in range(batch)]
+        out_caches = []
+        for i, (past, n) in enumerate(zip(pasts, new_lengths)):
+            k_i = k_new[i, :n]
+            v_i = v_new[i, :n]
+            if past:
+                k_i = np.concatenate([caches[i][0], k_i], axis=0)
+                v_i = np.concatenate([caches[i][1], v_i], axis=0)
+            out_caches.append((k_i, v_i))
+
+        info = BatchForwardInfo(
+            batch_size=batch,
+            n_heads=self.n_heads,
+            query_positions=q_width,
+            key_positions=k_width,
+            score_elements=int(batch * self.n_heads * q_width * k_width),
+        )
+        return out_logits, out_caches, info
 
 
 # --------------------------------------------------------------------------
